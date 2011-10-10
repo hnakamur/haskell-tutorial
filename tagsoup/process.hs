@@ -1,116 +1,174 @@
 import Data.Char (ord)
+import Data.List (isPrefixOf, stripPrefix)
+import Data.Maybe (fromJust)
 import System.Environment
 import Text.HTML.TagSoup
 import Text.HTML.TagSoup.Tree
+import qualified Text.HTML.TagSoup.Tree.Zipper as Z
 import Text.StringLike
 import qualified Data.Text as T
 
 type MyTag = Tag String
 type MyTagTree = TagTree String
-type AttrsFunc = [Attribute String] -> [Attribute String]
+type MyZipper = Z.TagTreeZipper String
+type MyAttr = Attribute String
 
-{-main = do
-    [src, dst] <- getArgs
-    str <- readFile src
-    writeFile dst $
-        filterAscii (app (map processTagFunc) str)
-    return ()-}
+type AttrsFunc = [Attribute String] -> [Attribute String]
 
 main = do
     [src, dst] <- getArgs
     str <- readFile src
-    let tags = map processTagFunc (parseTags str)
-        tree = tagTree tags
-    writeFile dst $
-        renderTags' (flattenTree (processTreeFunc tree))
+    let trees = tagTree $ parseTags str
+        z = Z.toZipper (head trees)
+        z2 = walk processZipper z
+        tree2 = Z.fromZipper z2
+    writeFile dst $ renderTags' (flattenTree [tree2])
     return ()
 
-processTagFunc
-    = removeAttrsInTag "html" ["lang", "class"]
-    . removeAttrsInTag "span" ["lang"]
-    . removeAttrsInTag "pre" ["lang"]
-    . removeAttrsInTag "cite" ["lang"]
-    . removeAttrsInTag "bdo" ["lang"]
-    . removeAttrsInTag "li" ["value"]
-    . replaceAttrVal "a" "href"
-        "mailto-" "mailto:"
-    . replaceAttrVal "a" "href"
-        "http-//" "http://"
-    . replaceAttrVal "a" "href"
-        ":" "-"
-    . replaceAttrValInAnyTag "id"
-        ":" "-"
-    . replaceAttrValExact "link" "href"
-        "http://www.w3.org/StyleSheets/TR/W3C-ED" "W3C-ED"
-    . replaceAttrValExact "img" "src"
-        "http://www.w3.org/Icons/w3c_home" "images/w3c_home.png"
-    . replaceAttrValExact "a" "href"
-        "Overview.html" "spec.html"
-    . replaceNbsp
+walk :: (MyZipper -> MyZipper) -> MyZipper -> MyZipper
+walk f z
+    = let z2 = f z
+      in case Z.nextBranch z2 of
+             Just z3 -> walk f z3
+             Nothing -> z2
 
-processTreeFunc
-    = removeTagInTrees "form"
-    . (walkInTrees "object" unwrapObjectTag)
-    . (walkInTrees "table" insertTbody)
+processZipper :: MyZipper -> MyZipper
+processZipper z
+    = let (t, ctx) = removeInvalidHrefLinkTag
+                   $ unwrapObjectTag
+                   $ removeTag "form" z
+      in changeTheadToTbody $ insertTbodyTag (processTree t, ctx)
 
-walkInTrees :: String -> ([MyTagTree] -> [MyTagTree]) -> [MyTagTree] -> [MyTagTree]
-walkInTrees tagName f = concatMap (walkInTree tagName f)
+changeTheadToTbody :: MyZipper -> MyZipper
+changeTheadToTbody z@(TagBranch "thead" attrs children, ctx)
+    = case Z.nextSiblingBranch z of
+          Nothing -> (TagBranch "tbody" attrs children, ctx)
+          otherwise -> z
+changeTheadToTbody z = z
 
-walkInTree :: String -> ([MyTagTree] -> [MyTagTree]) -> MyTagTree -> [MyTagTree]
-walkInTree tagName f (TagBranch name attrs trees)
-    | tagName == name = f [TagBranch name attrs trees]
-    | otherwise = [TagBranch name attrs (walkInTrees tagName f trees)]
-walkInTree tagName f leaf@(TagLeaf _) = [leaf]
+insertTbodyTag :: MyZipper -> MyZipper
+insertTbodyTag z@(TagBranch "thead" attrs children, _)
+    = case Z.nextSiblingBranch z of
+          Just (TagBranch "tr" _ _, _)
+              -> case Z.wrapNextChildren (TagBranch "tbody" [] []) z of
+                     Just z2 -> z2
+                     Nothing -> error "failed to wrap children with <tbody>"
+          otherwise -> z
+insertTbodyTag z = z
 
-removeTagInTrees :: Eq str => str -> [TagTree str] -> [TagTree str]
-removeTagInTrees tagName = concatMap $ removeTagInTree tagName
+unwrapObjectTag :: MyZipper -> MyZipper
+unwrapObjectTag z@(TagBranch "object" _ _, _) = fromJust $ Z.unwrap z
+unwrapObjectTag z = z
 
-removeTagInTree :: Eq str => str -> TagTree str -> [TagTree str]
-removeTagInTree tagName (TagBranch name attrs trees)
-    | tagName == name = []
-    | otherwise = [TagBranch name attrs (removeTagInTrees tagName trees)]
-removeTagInTree tagName leaf@(TagLeaf _) = [leaf]
+removeTag :: String -> MyZipper -> MyZipper
+removeTag name z@(TagBranch name' _ _, _) | name == name'
+    = case Z.remove z of
+          Just z2 -> z2
+          Nothing -> z
+removeTag _ z = z
 
-tagTreeBranchNameLit :: Eq str => str -> TagTree str -> Bool
-tagTreeBranchNameLit name (TagBranch name' attrs trees) | name == name' = True
-tagTreeBranchNameLit _ _ = False
+removeInvalidHrefLinkTag :: MyZipper -> MyZipper
+removeInvalidHrefLinkTag z@((TagBranch "link" attrs _), _)
+    = case lookup "href" attrs of
+          Just val
+              -> if "data:text/css," `isPrefixOf` val
+                 then case Z.remove z of
+                          Just z2 -> z2
+                          Nothing -> z
+                 else z
+          Nothing -> z
+removeInvalidHrefLinkTag z = z
 
-app :: StringLike str => ([Tag str] -> [Tag str]) -> str -> str
-app f html = (renderTags . f . myParseTags) html
+processTree :: MyTagTree -> MyTagTree
+processTree t@(TagBranch name attrs children)
+    = replaceColonsInHref
+    $ replaceColonsInId
+    $ modifyAttrs (removeAttrsByNames ["lang"])
+    $ case name of
+          "html" -> modifyAttrs (removeAttrsByNames ["lang", "class"]) t
+          "li" -> modifyAttrs (removeAttrsByNames ["value"]) t
+          "link" -> modifyAttrs (replaceAttrValExact "href"
+                        "http://www.w3.org/StyleSheets/TR/W3C-ED" "W3C-ED") t
+          "img" -> modifyAttrs (replaceAttrValExact "src"
+                        "http://www.w3.org/Icons/w3c_home"
+                        "images/w3c_home.png") t
+          "a" -> modifyAttrs (
+                     (replaceAttrValExact "href"
+                        "infrastructure.html#conforming-documents"
+                        "infrastructure.html#conforming-html5-documents"
+                     ) .
+                     (replaceAttrValExact "href"
+                        "Overview.html"
+                        "http://dev.w3.org/html5/spec/Overview.html"
+                     )
+                  ) t
+          otherwise -> t
+processTree t@(TagLeaf _) = t
+
+replaceColonsInHref :: MyTagTree -> MyTagTree
+replaceColonsInHref = modifyAttrs $ modifyAttrVal "href" replaceColons
+
+replaceColons :: String -> String
+replaceColons
+    = replaceExceptPrefixes
+          (replace ":" "-")
+          ["mailto:", "http:", "https:", "data:"]                  
+
+replaceExceptPrefixes :: (String -> String) -> [String] -> String -> String
+replaceExceptPrefixes func [] input = func input
+replaceExceptPrefixes func (prefix:xs) input
+    = case replaceExceptPrefix func prefix input of
+          Just result -> result
+          Nothing -> replaceExceptPrefixes func xs input
+
+replaceExceptPrefix :: (String -> String) -> String -> String -> Maybe String
+replaceExceptPrefix func prefix input
+    = case stripPrefix prefix input of
+          Just rest -> Just (prefix ++ func rest)
+          Nothing -> Nothing
+
+replaceColonsInId :: MyTagTree -> MyTagTree
+replaceColonsInId = modifyAttrs (replaceAttrVal "id" ":" "-")
+
+modifyAttrs f (TagBranch name attrs children)
+    = (TagBranch name (f attrs) children)
+
+removeAttrsByNames :: [String] -> [MyAttr] -> [MyAttr]
+removeAttrsByNames names attrs = filter f attrs
+  where
+    f (name,val) = name `notElem` names
+
+modifyAttrVal :: String -> (String -> String) -> [MyAttr] -> [MyAttr]
+modifyAttrVal attrName func attrs = map f attrs
+  where
+    f (name,val) | name == attrName = (name, func val)
+                 | otherwise = (name, val)
+
+replaceAttrValExact :: String -> String -> String -> [MyAttr] -> [MyAttr]
+replaceAttrValExact attrName search rep attrs = map f attrs
+  where
+    f (name,val) | name == attrName = (name, replaceExact search rep val)
+                 | otherwise = (name, val)
+
+replaceExact :: String -> String -> String -> String
+replaceExact search rep input | search == input = rep
+                              | otherwise = input
+
+replaceAttrVal :: String -> String -> String -> [MyAttr] -> [MyAttr]
+replaceAttrVal attrName search rep attrs = map f attrs
+  where
+    f (name,val) | name == attrName = (name, replace search rep val)
+                 | otherwise = (name, val)
+
+replace :: String -> String -> String -> String
+replace search rep input
+    = T.unpack $ T.replace (T.pack search) (T.pack rep) (T.pack input)
 
 escapeNonAscii = concatMap escapeNonAsciiChar
 
 escapeNonAsciiChar c | c > '\x7f' = "&#" ++ show (ord c) ++ ";"
                      | otherwise = [c]
 
-myParseTags :: StringLike str => str -> [Tag str]
-myParseTags = parseTagsOptions $ parseOptionsEntities $ const Nothing
-
-procAttrs :: String -> AttrsFunc -> MyTag -> MyTag
-procAttrs tagName f (TagOpen tagName' attrs) | tagName == tagName'
-    = TagOpen tagName (f attrs)
-procAttrs _ _ tag = tag
-
-procAttrsInAnyTag :: AttrsFunc -> MyTag -> MyTag
-procAttrsInAnyTag f (TagOpen tagName attrs) = TagOpen tagName (f attrs)
-procAttrsInAnyTag _ tag = tag
-
-removeAttrInTag :: String -> String -> MyTag -> MyTag
-removeAttrInTag tagName attrName (TagOpen tagName' attrs)
-      | tagName == tagName' =
-    TagOpen tagName (removeAttrNameInAttrs attrName attrs)
-removeAttrInTag _ _ tag = tag
-
-{-removeAttrsInTag :: String -> [String] -> MyTag -> MyTag
-removeAttrsInTag tagNm attrNames (TagOpen tagNm' attrs) | tagNm == tagNm'
-    = TagOpen tagNm (removeAttrs attrNames attrs)
-removeAttrsInTag _ _ tag = tag-}
-
-removeAttrsInTag :: String -> [String] -> MyTag -> MyTag
-removeAttrsInTag tagName attrNames = procAttrs tagName (removeAttrs attrNames)
-
-removeLangAttrInHtmlTag :: MyTag -> MyTag
-removeLangAttrInHtmlTag = removeAttrInTag "html" "lang"
 
 removeAttrNameInAttrs :: StringLike str => str -> [(str,str)] -> [(str,str)]
 removeAttrNameInAttrs name attrs = [attr | attr <- attrs, fst attr /= name]
@@ -122,34 +180,6 @@ replaceNbsp :: MyTag -> MyTag
 replaceNbsp (TagText text) = TagText (replace "&nbsp;" " " text)
 replaceNbsp tag = tag
 
-replace :: String -> String -> String -> String
-replace search rep input
-    = T.unpack $ T.replace (T.pack search) (T.pack rep) (T.pack input)
-
-replaceExact :: String -> String -> String -> String
-replaceExact search rep input | search == input = rep
-                              | otherwise = input
-
-replaceAttrVal :: String -> String -> String -> String -> MyTag -> MyTag
-replaceAttrVal tagName attrName search rep
-    = procAttrs tagName (map f)
-  where
-    f (name,val) | name == attrName = (name, replace search rep val)
-                 | otherwise = (name, val)
-
-replaceAttrValInAnyTag :: String -> String -> String -> MyTag -> MyTag
-replaceAttrValInAnyTag attrName search rep
-    = procAttrsInAnyTag (map f)
-  where
-    f (name,val) | name == attrName = (name, replace search rep val)
-                 | otherwise = (name, val)
-
-replaceAttrValExact :: String -> String -> String -> String -> MyTag -> MyTag
-replaceAttrValExact tagName attrName search rep
-    = procAttrs tagName (map f)
-  where
-    f (name,val) | name == attrName = (name, replaceExact search rep val)
-                 | otherwise = (name, val)
 
 escapeHTML' :: String -> String
 escapeHTML' = escapeNonAscii . escapeHTML
@@ -188,105 +218,3 @@ renderTagsOptions' opts = strConcat . tags
         com xs = case uncons xs of
             Nothing -> []
             Just (x,xs) -> fromChar x : com xs
-
-
-unwrapObjectTag :: [MyTagTree] -> [MyTagTree]
-unwrapObjectTag = concatMap unwrapObjectTagSub
-
-unwrapObjectTagSub :: MyTagTree -> [MyTagTree]
-unwrapObjectTagSub (TagBranch "object" _ trees) = trees
-unwrapObjectTagSub t = [t]
-
-
-html1 = "<html lang=\"en\">\n\
-\  <body>Hello<hr></hr>World.</body>\n\
-\</html>"
-html1' = app (map removeLangAttrInHtmlTag) html1
-html1tree = tagTree $ parseTags html1
-
-html2 = "Hello&nbsp;World"
-html2' = app (map replaceNbsp) html2
-
-html3 = "<html lang=\"en\">\n\
-\  <body>Hello&nbsp;World.</body>\n\
-\</html>"
-html3' = app (map (removeLangAttrInHtmlTag . replaceNbsp)) html3
-html3tree = tagTree $ parseTags html3
-
-html4 :: String
-html4 = "<p>The <code title=\"\">javascript:</code> URL</p>"
-html4tags = parseTags html4
-
-html5 :: String
-html5 = "<title>Acknowledgements &#8212; HTML5</title>"
-html5tags = myParseTags html5
-
-html6 :: String
-html6 = "<table><thead><tr><td>1</td></tr></thead> <tr><td>2</td></tr><tr><td>3</td></tr></table>"
-html6tags = myParseTags html6
-html6tree = tagTree html6tags
-
-html7 :: String
-html7 = "<thead><tr><td>1</td></tr></thead> <tr><td>2</td></tr><tr><td>3</td></tr>"
-html7tags = myParseTags html7
-html7tree = tagTree html7tags
-
-html8 :: String
-html8 = "<p>Hello</p>\n\
-\<table> \n\
-\<thead>\n\
-\<tr>\n\
-\<th>title</th>\n\
-\</tr> \n\
-\</thead>\n\
-\<tr>         \n\
-\<td>1</td>\n\
-\</tr>              \n\
-\<tr>         \n\
-\<td>2</td>\n\
-\</tr>              \n\
-\</table>\n"
-html8tags = myParseTags html8
-html8tree = tagTree html8tags
-
-isBranch :: MyTagTree -> Bool
-isBranch (TagBranch _ _ _) = True
-isBranch (TagLeaf _ ) = False
-
-subTree (TagBranch _ _ t) = t
-
-isLeaf :: MyTagTree -> Bool
-isLeaf (TagBranch _ _ _) = False
-isLeaf (TagLeaf _ ) = True
-
-insertTbody :: [MyTagTree] -> [MyTagTree]
-insertTbody [] = []
-insertTbody (x:xs)
-  = case x of
-      TagBranch "table" attrs trees
-        -> TagBranch "table" attrs (insertTbodySub trees) : xs
-      otherwise -> x : (insertTbody xs)
-
-insertTbodySub :: [MyTagTree] -> [MyTagTree]
-insertTbodySub [] = []
-insertTbodySub xs
-  = case break isBranch xs of
-      (leaves, thead@(TagBranch "thead" attrs trees) : xs')
-        -> case break isBranch xs' of
-             (leaves', rest@(TagBranch "tr" _ _ : _))
-                   -> leaves ++ (thead : (leaves' ++ [TagBranch "tbody" [] rest]))
-             otherwise -> xs
-      otherwise -> xs
-
-{-insertTbodySub :: [MyTagTree] -> [MyTagTree]
-insertTbodySub [] = []
-insertTbodySub (x:xs)
-  = case x of
-      TagBranch "thead" attrs trees
-        -> case xs of
-             [] -> [x]
-             otherwise -> case break isBranch xs of
-               (leaves, (TagBranch "tr" _ _ : ys))
-                   -> x : (leaves ++ [TagBranch "tbody" [] xs])
-               otherwise -> x : xs
-      otherwise -> x : xs-}
